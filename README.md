@@ -31,3 +31,8 @@ vi .env
 
 7. 设置 crontab
     crontab -e
+
+0 2 * * * /root/cf_auto_bestip/run_cfst_us.sh >> /root/cf_auto_bestip/logs/cfst_us.log 2>&1
+0 4 * * * /root/cf_auto_bestip/push_to_kv.sh >> /root/cf_auto_bestip/logs/push_kv.log 2>&1
+0 3 * * 0 > /root/cf_auto_bestip/logs/cfst_us.log && > /root/cf_auto_bestip/logs/push_kv.log
+0 5 * * * SECRET=$(grep -i "^secret" /etc/openclash/Openclash_mrs.yaml | awk '{print $2}'); /usr/bin/curl -L -s '机场订阅地址' -o /etc/openclash/proxy_provider/机场名称.yaml; /usr/bin/curl -s -X PUT 'http://127.0.0.1:9090/providers/proxies/机场名称' -H "Authorization: Bearer $SECRET"
