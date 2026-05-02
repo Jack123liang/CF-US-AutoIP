@@ -1,0 +1,25 @@
+# CF-US-AutoIP
+# CF 美国优选IP 自动化
+
+## 重装步骤
+
+1. 创建目录
+mkdir -p /root/cf_auto_bestip/data /root/cf_auto_bestip/logs
+
+2. 克隆脚本
+git clone https://github.com/你的账号/cf-bestip.git /root/cf_auto_bestip
+
+3. 下载 cfst 二进制
+cd /root/cf_auto_bestip
+wget -O cfst.tar.gz https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.4/CloudflareST_linux_arm64.tar.gz
+tar -xzf cfst.tar.gz && chmod +x cfst && rm cfst.tar.gz
+
+4. 创建 .env 填入敏感数据
+cp .env.example .env
+vi .env
+
+5. 赋权
+chmod +x run_cfst_us.sh push_to_kv.sh
+
+6. 设置 crontab
+crontab -e
