@@ -25,7 +25,7 @@ vi .env
 
 6.验证
 
-   cd /root/cf_auto_bestip
+    cd /root/cf_auto_bestip
    ./run_cfst_us.sh && ./push_to_kv.sh
 
 7. 设置 crontab
