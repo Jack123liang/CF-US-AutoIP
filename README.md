@@ -18,6 +18,7 @@ vi .env
 (.env真实数据存于iCloud）
 
 5. 赋权
+
 chmod +x run_cfst_us.sh push_to_kv.sh
 
 (chmod +x /root/cf_auto_bestip/run_cfst_us.sh）
@@ -25,6 +26,7 @@ chmod +x run_cfst_us.sh push_to_kv.sh
 (chmod +x /root/cf_auto_bestip/push_to_kv.sh)
 
 6.验证
+
 cd /root/cf_auto_bestip
 ./run_cfst_us.sh && ./push_to_kv.sh
 
