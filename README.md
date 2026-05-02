@@ -5,7 +5,7 @@
 mkdir -p /root/cf_auto_bestip/data /root/cf_auto_bestip/logs
 
 2. 克隆脚本
-git clone [https://github.com/Jack123liang/CF-US-AutoIP.git /root/cf_auto_bestip
+git clone https://github.com/Jack123liang/CF-US-AutoIP.git /root/cf_auto_bestip
 
 4. 下载 cfst 二进制
 cd /root/cf_auto_bestip
