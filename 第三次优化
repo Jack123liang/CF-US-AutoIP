@@ -1,4 +1,3 @@
-第二次优选改良后的第四种方法：
 第一：
 
 cat > /root/cf_auto_bestip/run_cfst_us.sh << 'EOF'
