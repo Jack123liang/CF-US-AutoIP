@@ -1,3 +1,4 @@
+第二次优选改良后的第四种方法：
 第一：
 
 cat > /root/cf_auto_bestip/run_cfst_us.sh << 'EOF'
@@ -10,10 +11,11 @@ SAMPLE_FILE="$DATA_DIR/cfst_ips.txt"
 ACCUM_FILE="$DATA_DIR/cfst_preferred_ips.txt"
 TEMP_FILE="$DATA_DIR/cfst_us_new.txt"
 COLO="LAX,SEA,SJC"
-LATENCY_MAX=300
+LATENCY_MAX=400
 LATENCY_MIN=10
 SPEED_MIN=10
-DN=30
+DN=20
+N=20
 DT=10
 PORT=443
 MAX_POOL_SIZE=500
@@ -58,7 +60,7 @@ curl -s --max-time 30 "https://zip.cm.edu.kg/all.txt" \
 SRC1_COUNT=$(wc -l < "$DATA_DIR/src1.tmp")
 echo "$TIMESTAMP [INFO]  源1获取: ${SRC1_COUNT} 个IP"
 
-# 源2：Cloudflare 官方CIDR，每段随机展开54个IP（占比约50%）
+# 源2：Cloudflare 官方CIDR，范围/13~/24，每段随机展开54个IP
 curl -s --max-time 30 "https://www.cloudflare.com/ips-v4" \
   > "$DATA_DIR/src2_cidr.tmp" 2>/dev/null
 
@@ -67,11 +69,33 @@ while IFS= read -r CIDR; do
   [ -z "$CIDR" ] && continue
   BASE=$(echo "$CIDR" | cut -d'/' -f1)
   PREFIX=$(echo "$CIDR" | cut -d'/' -f2)
-  if [ "$PREFIX" -ge 16 ] && [ "$PREFIX" -le 24 ]; then
+  if [ "$PREFIX" -ge 13 ] && [ "$PREFIX" -le 24 ]; then
     IFS='.' read -r a b c d <<< "$BASE"
-    awk -v a="$a" -v b="$b" -v c="$c" \
-      'BEGIN{srand(); for(i=1;i<=54;i++) print a"."b"."c"."int(rand()*253)+1}' \
-      >> "$DATA_DIR/src2.tmp"
+    if [ "$PREFIX" -le 15 ]; then
+      # 大段（/13~/15）：随机第2、3、4段
+      awk -v a="$a" 'BEGIN{srand();
+        for(i=1;i<=54;i++){
+          b=int(rand()*256);
+          c=int(rand()*256);
+          d=int(rand()*253)+1;
+          print a"."b"."c"."d
+        }}' >> "$DATA_DIR/src2.tmp"
+    elif [ "$PREFIX" -le 17 ]; then
+      # 中段（/16~/17）：随机第3、4段
+      awk -v a="$a" -v b="$b" 'BEGIN{srand();
+        for(i=1;i<=54;i++){
+          c=int(rand()*256);
+          d=int(rand()*253)+1;
+          print a"."b"."c"."d
+        }}' >> "$DATA_DIR/src2.tmp"
+    else
+      # 小段（/18~/24）：随机第4段
+      awk -v a="$a" -v b="$b" -v c="$c" 'BEGIN{srand();
+        for(i=1;i<=54;i++){
+          d=int(rand()*253)+1;
+          print a"."b"."c"."d
+        }}' >> "$DATA_DIR/src2.tmp"
+    fi
   fi
 done < "$DATA_DIR/src2_cidr.tmp"
 rm -f "$DATA_DIR/src2_cidr.tmp"
@@ -79,24 +103,17 @@ rm -f "$DATA_DIR/src2_cidr.tmp"
 SRC2_COUNT=$(wc -l < "$DATA_DIR/src2.tmp")
 echo "$TIMESTAMP [INFO]  源2获取: ${SRC2_COUNT} 个IP（CF官方CIDR随机展开）"
 
-# 合并两个源，去重，随机打乱，各抽一半组成1500个样本
+# 合并两个源，各抽一半组成1500个样本
 HALF=$((SAMPLE_COUNT / 2))
 
-# 源1随机抽750个
 awk 'BEGIN{srand()}{print rand(),$0}' "$DATA_DIR/src1.tmp" \
-  | sort -n \
-  | cut -d' ' -f2- \
-  | head -"$HALF" \
+  | sort -n | cut -d' ' -f2- | head -"$HALF" \
   > "$DATA_DIR/sample1.tmp"
 
-# 源2随机抽750个
 awk 'BEGIN{srand()}{print rand(),$0}' "$DATA_DIR/src2.tmp" \
-  | sort -n \
-  | cut -d' ' -f2- \
-  | head -"$HALF" \
+  | sort -n | cut -d' ' -f2- | head -"$HALF" \
   > "$DATA_DIR/sample2.tmp"
 
-# 合并去重
 cat "$DATA_DIR/sample1.tmp" "$DATA_DIR/sample2.tmp" \
   | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
   | sort -u \
@@ -131,6 +148,7 @@ echo "$TIMESTAMP [INFO]  开始美国机场专项测速（$COLO）..."
   -tl "$LATENCY_MAX" \
   -tll "$LATENCY_MIN" \
   -sl "$SPEED_MIN" \
+  -n "$N" \
   -dn "$DN" \
   -dt "$DT" \
   -o "$RESULT_CSV"
