@@ -1,0 +1,651 @@
+第一：
+
+cat > /root/cf_auto_bestip/run_cfst_us.sh << 'EOF'
+#!/bin/bash
+PROJ_DIR="/root/cf_auto_bestip"
+DATA_DIR="$PROJ_DIR/data"
+LOG_DIR="$PROJ_DIR/logs"
+RESULT_CSV="$PROJ_DIR/result.csv"
+SAMPLE_FILE="$DATA_DIR/cfst_ips.txt"
+ACCUM_FILE="$DATA_DIR/cfst_preferred_ips.txt"
+TEMP_FILE="$DATA_DIR/cfst_us_new.txt"
+COLO="LAX,SEA,SJC"
+LATENCY_MAX=300
+LATENCY_MIN=10
+SPEED_MIN=1
+DN=20
+DT=10
+PORT=443
+MAX_POOL_SIZE=500
+SAMPLE_COUNT=1500
+
+[ -f "$PROJ_DIR/.env" ] && source "$PROJ_DIR/.env"
+mkdir -p "$DATA_DIR" "$LOG_DIR"
+TIMESTAMP="[$(date '+%Y-%m-%d %H:%M:%S')]"
+
+echo "============================================================"
+echo "$TIMESTAMP 美国CF节点专项测速开始"
+echo "  目标机场 : $COLO"
+echo "============================================================"
+
+# ---- 找二进制 -----------------------------------------------
+CFST_BIN=""
+for candidate in "$PROJ_DIR/CloudflareST" "$PROJ_DIR/CloudflareSpeedTest" "$PROJ_DIR/cfst"; do
+  if [ -x "$candidate" ]; then
+    CFST_BIN="$candidate"
+    break
+  fi
+done
+if [ -z "$CFST_BIN" ]; then
+  found=$(find "$PROJ_DIR" -maxdepth 3 -type f \( -name "CloudflareST" -o -name "CloudflareSpeedTest" -o -name "cfst" \) -perm /111 2>/dev/null | head -1)
+  [ -n "$found" ] && CFST_BIN="$found"
+fi
+if [ -z "$CFST_BIN" ]; then
+  echo "$TIMESTAMP [ERROR] 未找到 CloudflareST 二进制"
+  exit 1
+fi
+echo "$TIMESTAMP [INFO]  使用二进制: $CFST_BIN"
+
+# ---- 第一步：从公共源拉取IP ---------------------------------
+echo "$TIMESTAMP [INFO]  从公共源拉取IP..."
+
+# 源1：zip.cm.edu.kg 格式 1.2.3.4:443#US → 提取纯IP
+curl -s --max-time 30 "https://zip.cm.edu.kg/all.txt" \
+  | sed 's/:[0-9]*#.*//' \
+  | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
+  > "$DATA_DIR/src1.tmp" 2>/dev/null
+
+SRC1_COUNT=$(wc -l < "$DATA_DIR/src1.tmp")
+echo "$TIMESTAMP [INFO]  源1获取: ${SRC1_COUNT} 个IP"
+
+# 源2：Cloudflare 官方CIDR，每段随机展开54个IP（占比约50%）
+curl -s --max-time 30 "https://www.cloudflare.com/ips-v4" \
+  > "$DATA_DIR/src2_cidr.tmp" 2>/dev/null
+
+> "$DATA_DIR/src2.tmp"
+while IFS= read -r CIDR; do
+  [ -z "$CIDR" ] && continue
+  BASE=$(echo "$CIDR" | cut -d'/' -f1)
+  PREFIX=$(echo "$CIDR" | cut -d'/' -f2)
+  if [ "$PREFIX" -ge 16 ] && [ "$PREFIX" -le 24 ]; then
+    IFS='.' read -r a b c d <<< "$BASE"
+    awk -v a="$a" -v b="$b" -v c="$c" \
+      'BEGIN{srand(); for(i=1;i<=54;i++) print a"."b"."c"."int(rand()*253)+1}' \
+      >> "$DATA_DIR/src2.tmp"
+  fi
+done < "$DATA_DIR/src2_cidr.tmp"
+rm -f "$DATA_DIR/src2_cidr.tmp"
+
+SRC2_COUNT=$(wc -l < "$DATA_DIR/src2.tmp")
+echo "$TIMESTAMP [INFO]  源2获取: ${SRC2_COUNT} 个IP（CF官方CIDR随机展开）"
+
+# 合并两个源，去重，随机打乱，各抽一半组成1500个样本
+HALF=$((SAMPLE_COUNT / 2))
+
+# 源1随机抽750个
+awk 'BEGIN{srand()}{print rand(),$0}' "$DATA_DIR/src1.tmp" \
+  | sort -n \
+  | cut -d' ' -f2- \
+  | head -"$HALF" \
+  > "$DATA_DIR/sample1.tmp"
+
+# 源2随机抽750个
+awk 'BEGIN{srand()}{print rand(),$0}' "$DATA_DIR/src2.tmp" \
+  | sort -n \
+  | cut -d' ' -f2- \
+  | head -"$HALF" \
+  > "$DATA_DIR/sample2.tmp"
+
+# 合并去重
+cat "$DATA_DIR/sample1.tmp" "$DATA_DIR/sample2.tmp" \
+  | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
+  | sort -u \
+  | awk 'BEGIN{srand()}{print rand(),$0}' \
+  | sort -n \
+  | cut -d' ' -f2- \
+  | head -"$SAMPLE_COUNT" \
+  > "$SAMPLE_FILE"
+
+rm -f "$DATA_DIR/src1.tmp" "$DATA_DIR/src2.tmp" \
+      "$DATA_DIR/sample1.tmp" "$DATA_DIR/sample2.tmp"
+
+SAMPLE_TOTAL=$(wc -l < "$SAMPLE_FILE")
+if [ "$SAMPLE_TOTAL" -eq 0 ]; then
+  echo "$TIMESTAMP [ERROR] 无法从公共源获取IP，退出"
+  exit 1
+fi
+echo "$TIMESTAMP [INFO]  抽样完成，共 ${SAMPLE_TOTAL} 个候选IP（源1:${HALF} + 源2:${HALF}）"
+
+# ---- 第二步：关闭Clash，美国机场专项测速 --------------------
+/etc/init.d/openclash stop 2>/dev/null
+sleep 3
+
+echo "$TIMESTAMP [INFO]  开始美国机场专项测速（$COLO）..."
+
+"$CFST_BIN" \
+  -httping \
+  -url https://cf.xiu2.xyz/url \
+  -cfcolo "$COLO" \
+  -f "$SAMPLE_FILE" \
+  -tp "$PORT" \
+  -tl "$LATENCY_MAX" \
+  -tll "$LATENCY_MIN" \
+  -sl "$SPEED_MIN" \
+  -dn "$DN" \
+  -dt "$DT" \
+  -o "$RESULT_CSV"
+
+EXIT_CODE=$?
+/etc/init.d/openclash start 2>/dev/null
+
+if [ $EXIT_CODE -ne 0 ] || [ ! -f "$RESULT_CSV" ]; then
+  echo "$TIMESTAMP [ERROR] 测速失败或无结果"
+  exit 1
+fi
+
+# ---- 第三步：提取IP，按机场码过滤 ---------------------------
+tail -n +2 "$RESULT_CSV" \
+  | grep -E 'LAX|SJC|SEA' \
+  | cut -d',' -f1 \
+  | sed 's/:[0-9]*$//' \
+  | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
+  > "$TEMP_FILE"
+
+NEW_COUNT=$(wc -l < "$TEMP_FILE")
+echo "$TIMESTAMP [INFO]  本次测速得到 ${NEW_COUNT} 个美国优质IP"
+
+if [ "$NEW_COUNT" -eq 0 ]; then
+  echo "$TIMESTAMP [WARN]  无新IP，池文件保持不变"
+  echo "0" > /tmp/cfst_new_count.txt
+  exit 0
+fi
+
+# ---- 第四步：合并去重写入池文件 -----------------------------
+if [ -f "$ACCUM_FILE" ] && [ -s "$ACCUM_FILE" ]; then
+  BEFORE=$(wc -l < "$ACCUM_FILE")
+  cat "$ACCUM_FILE" "$TEMP_FILE" | sort -u > "${ACCUM_FILE}.tmp"
+  mv "${ACCUM_FILE}.tmp" "$ACCUM_FILE"
+  AFTER=$(wc -l < "$ACCUM_FILE")
+  ADDED=$((AFTER - BEFORE))
+  echo "$TIMESTAMP [INFO]  合并去重: ${BEFORE} → ${AFTER} 个IP（新增 ${ADDED} 个）"
+else
+  cp "$TEMP_FILE" "$ACCUM_FILE"
+  AFTER=$(wc -l < "$ACCUM_FILE")
+  ADDED=$AFTER
+  echo "$TIMESTAMP [INFO]  初始化池，写入 ${AFTER} 个IP"
+fi
+
+echo "$ADDED" > /tmp/cfst_new_count.txt
+echo "$TIMESTAMP [INFO]  本次真实新增 ${ADDED} 个，已记录"
+
+# ---- 第五步：超出上限裁剪 -----------------------------------
+if [ "$(wc -l < "$ACCUM_FILE")" -gt "$MAX_POOL_SIZE" ]; then
+  tail -n "$MAX_POOL_SIZE" "$ACCUM_FILE" > "${ACCUM_FILE}.tmp"
+  mv "${ACCUM_FILE}.tmp" "$ACCUM_FILE"
+  echo "$TIMESTAMP [INFO]  池裁剪至 ${MAX_POOL_SIZE} 条"
+fi
+
+FINAL_COUNT=$(wc -l < "$ACCUM_FILE")
+echo "============================================================"
+echo "$TIMESTAMP 测速完成，累积池: ${FINAL_COUNT} / ${MAX_POOL_SIZE} 个"
+echo "============================================================"
+EOF
+
+
+
+
+第二：
+
+cat > /root/cf_auto_bestip/push_to_kv.sh << 'EOF'
+#!/bin/bash
+PROJ_DIR="/root/cf_auto_bestip"
+DATA_DIR="$PROJ_DIR/data"
+POOL_FILE="$DATA_DIR/cfst_preferred_ips.txt"
+CHECK_RESULT="$DATA_DIR/health_result.csv"
+ROLES_FILE="$DATA_DIR/ip_roles.txt"
+HISTORY_FILE="$DATA_DIR/ip_score_history.txt"
+
+[ -f "$PROJ_DIR/.env" ] && source "$PROJ_DIR/.env"
+
+TOP_KV=10
+TOP_DNS=3
+TS="[$(date '+%Y-%m-%d %H:%M:%S')]"
+
+echo "============================================================"
+echo "$TS 开始健康检测 + 推送"
+echo "============================================================"
+
+# ---- 找二进制 -----------------------------------------------
+CFST_BIN=""
+for c in "$PROJ_DIR/CloudflareST" "$PROJ_DIR/CloudflareSpeedTest" "$PROJ_DIR/cfst"; do
+  [ -x "$c" ] && CFST_BIN="$c" && break
+done
+if [ -z "$CFST_BIN" ]; then
+  CFST_BIN=$(find "$PROJ_DIR" -maxdepth 3 -type f \( -name "CloudflareST" -o -name "cfst" \) -perm /111 2>/dev/null | head -1)
+fi
+if [ -z "$CFST_BIN" ]; then
+  echo "$TS [ERROR] 未找到 CloudflareST 二进制"
+  exit 1
+fi
+
+# ---- 检查IP池 -----------------------------------------------
+if [ ! -f "$POOL_FILE" ] || [ ! -s "$POOL_FILE" ]; then
+  echo "$TS [ERROR] IP池为空"
+  exit 1
+fi
+TOTAL=$(wc -l < "$POOL_FILE")
+echo "$TS [INFO]  IP池共 ${TOTAL} 个，开始健康检测..."
+
+# ---- 关闭Clash，健康检测 ------------------------------------
+/etc/init.d/openclash stop 2>/dev/null
+sleep 3
+
+"$CFST_BIN" \
+  -f "$POOL_FILE" \
+  -tl 900 \
+  -sl 0 \
+  -dn 999 \
+  -dt 8 \
+  -o "$CHECK_RESULT"
+
+/etc/init.d/openclash start 2>/dev/null
+sleep 5
+
+if [ ! -f "$CHECK_RESULT" ]; then
+  echo "$TS [ERROR] 健康检测无结果"
+  exit 1
+fi
+
+PASS=$(tail -n +2 "$CHECK_RESULT" | wc -l)
+echo "$TS [INFO]  通过检测: ${PASS} 个IP"
+
+# ---- 综合评分函数 (Emby 4K & 已选池优化版) ---------------------------
+calc_score() {
+  local IP="$1"
+  grep "^${IP}" "$CHECK_RESULT" | awk -F',' '{
+    loss=$4; rtt=$5; speed=$6; region=$7;
+    gsub(/[^A-Za-z]/, "", region);
+    
+    score=0;
+    # 1. 速度权重 (最高 100 分): 针对 4K 视频大幅拉升
+    if (speed > 40) score += 100;
+    else if (speed > 25) score += 80;
+    else if (speed > 10) score += 40;
+    else if (speed > 5) score += 10;
+    else score -= 50;
+
+    # 2. 延迟权重 (最高 20 分): 放宽至 250ms
+    if (rtt < 150) score += 20;
+    else if (rtt < 250) score += 15;
+    else if (rtt < 400) score += 5;
+
+    # 3. 稳定性评分 (最高 30 分): 丢包权重高，防止 4K 频繁缓冲
+    if (loss == 0) score += 30;
+    else if (loss < 1) score += 10;
+    else score -= 100;
+
+    # 4. 地区加成 (微调 5 分): 仅作为同分时的参考
+    if (region ~ /^(LAX|SEA|SJC)$/) score += 5;
+
+    print score
+  }'
+}
+
+# ---- 对所有通过检测的 IP 计算综合评分 (移除 Region 过滤) -------
+echo "$TS [INFO]  执行 Emby 优化评分权重排序 (带宽优先模式)..."
+
+ALL_SCORED=$(tail -n +2 "$CHECK_RESULT" \
+  | awk -F',' '{
+      ip=$1; loss=$4; rtt=$5; speed=$6; region=$7;
+      gsub(/:[0-9]+$/, "", ip);
+      gsub(/[^A-Za-z]/, "", region);
+      
+      # 因为已经是优选池，不再做 Region 硬性过滤，防止误删高带宽 IP
+      score=0;
+      # 速度权重
+      if (speed > 40) score += 100;
+      else if (speed > 25) score += 80;
+      else if (speed > 10) score += 40;
+      else if (speed > 5) score += 10;
+      else score -= 50;
+
+      # 延迟权重
+      if (rtt < 150) score += 20;
+      else if (rtt < 250) score += 15;
+      else if (rtt < 400) score += 5;
+
+      # 稳定性
+      if (loss == 0) score += 30;
+      else if (loss < 1) score += 10;
+      else score -= 100;
+
+      # 地区加成
+      if (region ~ /^(LAX|SEA|SJC)$/) score += 5;
+
+      print score, ip
+    }' \
+  | sort -rn)
+
+# ---- 更新历史评分记录 ---------------------------------------
+touch "$HISTORY_FILE"
+
+echo "$ALL_SCORED" | while read SCORE IP; do
+  [ -z "$IP" ] && continue
+  if grep -q "^$IP " "$HISTORY_FILE"; then
+    # 已有记录，追加今天评分，只保留最近3天
+    OLD=$(grep "^$IP " "$HISTORY_FILE" | awk '{$1=""; print $0}' | xargs)
+    NEW_RECORD="$IP $OLD $SCORE"
+    # 只保留最近3个评分
+    NEW_RECORD=$(echo "$NEW_RECORD" | awk '{
+      n=NF;
+      if(n>4) {printf $1; for(i=n-2;i<=n;i++) printf " "$i; print ""}
+      else print $0
+    }')
+    sed -i "s|^$IP .*|$NEW_RECORD|" "$HISTORY_FILE"
+  else
+    echo "$IP $SCORE" >> "$HISTORY_FILE"
+  fi
+done
+
+# ---- 读取/初始化 DNS角色文件 --------------------------------
+if [ ! -f "$ROLES_FILE" ]; then
+  # 首次运行，从评分最高的3个IP初始化
+  echo "$TS [INFO]  首次运行，初始化IP角色..."
+  TOP3=$(echo "$ALL_SCORED" | head -3 | awk '{print $2}')
+  IP1=$(echo "$TOP3" | sed -n '1p')
+  IP2=$(echo "$TOP3" | sed -n '2p')
+  IP3=$(echo "$TOP3" | sed -n '3p')
+  cat > "$ROLES_FILE" << ROLES
+IP1=$IP1
+IP2=$IP2
+IP3=$IP3
+ROLES
+  echo "$TS [INFO]  初始化完成: IP1=$IP1 IP2=$IP2 IP3=$IP3"
+else
+  # 读取现有角色
+  IP1=$(grep "^IP1=" "$ROLES_FILE" | cut -d'=' -f2)
+  IP2=$(grep "^IP2=" "$ROLES_FILE" | cut -d'=' -f2)
+  IP3=$(grep "^IP3=" "$ROLES_FILE" | cut -d'=' -f2)
+  echo "$TS [INFO]  当前角色: IP1=$IP1 IP2=$IP2 IP3=$IP3"
+fi
+
+# ---- 轮动机制 -----------------------------------------------
+echo "$TS [INFO]  开始轮动评估..."
+
+# 获取各角色当前评分
+S1=$(echo "$ALL_SCORED" | grep " $IP1$" | awk '{print $1}' | head -1)
+S2=$(echo "$ALL_SCORED" | grep " $IP2$" | awk '{print $1}' | head -1)
+S3=$(echo "$ALL_SCORED" | grep " $IP3$" | awk '{print $1}' | head -1)
+[ -z "$S1" ] && S1=0
+[ -z "$S2" ] && S2=0
+[ -z "$S3" ] && S3=0
+
+echo "$TS [INFO]  评分: IP1($IP1)=$S1 IP2($IP2)=$S2 IP3($IP3)=$S3"
+
+# 获取历史评分（最近3天）
+get_history_scores() {
+  local IP="$1"
+  grep "^$IP " "$HISTORY_FILE" | awk '{$1=""; print $0}' | xargs
+}
+
+# 检查连续N天超过对方
+check_consecutive_better() {
+  local CHALLENGER="$1"
+  local DEFENDER="$2"
+  local DAYS="$3"
+  local C_SCORES D_SCORES
+  C_SCORES=$(get_history_scores "$CHALLENGER")
+  D_SCORES=$(get_history_scores "$DEFENDER")
+  local C_COUNT D_COUNT WIN=0
+  C_COUNT=$(echo "$C_SCORES" | wc -w)
+  D_COUNT=$(echo "$D_SCORES" | wc -w)
+  [ "$C_COUNT" -lt "$DAYS" ] || [ "$D_COUNT" -lt "$DAYS" ] && echo 0 && return
+  for i in $(seq 1 $DAYS); do
+    C_VAL=$(echo "$C_SCORES" | awk "{print \$$((C_COUNT-DAYS+i))}")
+    D_VAL=$(echo "$D_SCORES" | awk "{print \$$((D_COUNT-DAYS+i))}")
+    [ -z "$C_VAL" ] && C_VAL=0
+    [ -z "$D_VAL" ] && D_VAL=0
+    if [ "$C_VAL" -gt "$D_VAL" ]; then
+      WIN=$((WIN+1))
+    fi
+  done
+  [ "$WIN" -eq "$DAYS" ] && echo 1 || echo 0
+}
+
+# IP3探测位：换成池子里评分最高但不在DNS里的IP
+NEW_IP3=$(echo "$ALL_SCORED" | awk '{print $2}' | while read IP; do
+  if [ "$IP" != "$IP1" ] && [ "$IP" != "$IP2" ] && [ "$IP" != "$IP3" ]; then
+    echo "$IP"
+    break
+  fi
+done)
+
+if [ -n "$NEW_IP3" ]; then
+  echo "$TS [INFO]  IP3探测位更新: $IP3 → $NEW_IP3"
+  IP3="$NEW_IP3"
+fi
+
+# IP3晋升检查（连续2天超过IP2）
+CAN_PROMOTE_3=$(check_consecutive_better "$IP3" "$IP2" 2)
+if [ "$CAN_PROMOTE_3" = "1" ]; then
+  echo "$TS [INFO]  🆙 IP3晋升！$IP3(IP3) → IP2，$IP2(IP2) → IP3"
+  OLD_IP2="$IP2"
+  IP2="$IP3"
+  IP3="$OLD_IP2"
+fi
+
+# IP2晋升检查（连续3天超过IP1）
+CAN_PROMOTE_2=$(check_consecutive_better "$IP2" "$IP1" 3)
+if [ "$CAN_PROMOTE_2" = "1" ]; then
+  echo "$TS [INFO]  🆙 IP2晋升！$IP2(IP2) → IP1，$IP1(IP1) → 退出DNS"
+  IP1="$IP2"
+  IP2="$IP3"
+  # IP3换新探测IP
+  IP3=$(echo "$ALL_SCORED" | awk '{print $2}' | while read IP; do
+    if [ "$IP" != "$IP1" ] && [ "$IP" != "$IP2" ]; then
+      echo "$IP"
+      break
+    fi
+  done)
+fi
+
+# 保存更新后的角色
+cat > "$ROLES_FILE" << ROLES
+IP1=$IP1
+IP2=$IP2
+IP3=$IP3
+ROLES
+echo "$TS [INFO]  角色更新完成: IP1=$IP1 IP2=$IP2 IP3=$IP3"
+
+# ---- 动态平衡：删除评分最低N个 ------------------------------
+NEW_COUNT=0
+[ -f /tmp/cfst_new_count.txt ] && NEW_COUNT=$(cat /tmp/cfst_new_count.txt | tr -d '[:space:]')
+
+if [ "$NEW_COUNT" -gt 0 ]; then
+  echo "$TS [INFO]  动态平衡：删除评分最低 ${NEW_COUNT} 个IP..."
+  WORST_IPS=$(echo "$ALL_SCORED" | tail -n "$NEW_COUNT" | awk '{print $2}')
+  while IFS= read -r BAD_IP; do
+    [ -z "$BAD_IP" ] && continue
+    # 不删除当前DNS角色IP
+    if [ "$BAD_IP" = "$IP1" ] || [ "$BAD_IP" = "$IP2" ] || [ "$BAD_IP" = "$IP3" ]; then
+      echo "$TS [INFO]  跳过DNS角色IP: $BAD_IP"
+      continue
+    fi
+    sed -i "/^${BAD_IP}$/d" "$POOL_FILE"
+    echo "$TS [INFO]  已淘汰低分IP: $BAD_IP"
+  done <<< "$WORST_IPS"
+  AFTER_BALANCE=$(wc -l < "$POOL_FILE")
+  echo "$TS [INFO]  动态平衡后池子: ${AFTER_BALANCE} 个"
+  rm -f /tmp/cfst_new_count.txt
+else
+  echo "$TS [INFO]  今天无新增IP，跳过动态平衡"
+fi
+
+# ---- 推送前10个到KV ----------------------------------------
+SORTED_IPS=$(echo "$ALL_SCORED" | awk '{print $2}')
+DATE=$(date '+%m%d')
+ADD_VALUE=""
+COUNT=0
+while IFS= read -r IP && [ $COUNT -lt $TOP_KV ]; do
+  IP=$(echo "$IP" | tr -d '[:space:]')
+  [ -z "$IP" ] && continue
+  NUM=$(printf "%02d" $((COUNT+1)))
+  ENTRY="${IP}:443#US 美国优选${NUM} ${DATE}"
+  [ -z "$ADD_VALUE" ] && ADD_VALUE="$ENTRY" || ADD_VALUE="${ADD_VALUE}
+${ENTRY}"
+  COUNT=$((COUNT+1))
+done <<< "$SORTED_IPS"
+
+echo "$TS [INFO]  推送 ${COUNT} 个IP到KV..."
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+  "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/storage/kv/namespaces/$KV_NAMESPACE_ID/values/$KV_KEY" \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H "Content-Type: text/plain" \
+  --data "$ADD_VALUE")
+
+if [ "$HTTP_CODE" -eq 200 ]; then
+  echo "$TS [SUCCESS] KV推送成功 (HTTP 200)"
+else
+  echo "$TS [ERROR]  KV推送失败 (HTTP $HTTP_CODE)"
+fi
+
+# ---- DNS平滑更新函数 ----------------------------------------
+update_dns_record() {
+  local TARGET_IP="$1"
+  local INDEX="$2"
+
+  local RESPONSE
+  RESPONSE=$(curl -s \
+    "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=A&name=$DOMAIN" \
+    -H "Authorization: Bearer $API_TOKEN")
+
+  local RID
+  RID=$(echo "$RESPONSE" | jq -r ".result[${INDEX}].id // empty" 2>/dev/null)
+
+  if [ -n "$RID" ] && [ "$RID" != "null" ]; then
+    local RES
+    RES=$(curl -s -X PUT \
+      "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RID" \
+      -H "Authorization: Bearer $API_TOKEN" \
+      -H "Content-Type: application/json" \
+      --data "{\"type\":\"A\",\"name\":\"$DOMAIN\",\"content\":\"$TARGET_IP\",\"ttl\":60,\"proxied\":false}")
+    local SUCCESS
+    SUCCESS=$(echo "$RES" | jq -r '.success' 2>/dev/null)
+    if [ "$SUCCESS" = "true" ]; then
+      echo "$TS [INFO]  DNS更新(PUT) #$((INDEX+1)): $TARGET_IP"
+    else
+      echo "$TS [WARN]  DNS更新失败，尝试新建..."
+      curl -s -X POST \
+        "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+        -H "Authorization: Bearer $API_TOKEN" \
+        -H "Content-Type: application/json" \
+        --data "{\"type\":\"A\",\"name\":\"$DOMAIN\",\"content\":\"$TARGET_IP\",\"ttl\":60,\"proxied\":false}" > /dev/null
+      echo "$TS [INFO]  DNS新建(POST) #$((INDEX+1)): $TARGET_IP"
+    fi
+  else
+    curl -s -X POST \
+      "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+      -H "Authorization: Bearer $API_TOKEN" \
+      -H "Content-Type: application/json" \
+      --data "{\"type\":\"A\",\"name\":\"$DOMAIN\",\"content\":\"$TARGET_IP\",\"ttl\":60,\"proxied\":false}" > /dev/null
+    echo "$TS [INFO]  DNS新建(POST) #$((INDEX+1)): $TARGET_IP"
+  fi
+}
+
+# ---- DNS 全量强制同步函数 (解决记录遗留问题) -------------------------
+sync_dns_records() {
+  echo "$TS [INFO]  开始全量 DNS 同步，清理冗余记录..."
+
+  # 1. 获取当前所有 A 记录的 ID
+  local ALL_IDS
+  ALL_IDS=$(curl -s \
+    "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=A&name=$DOMAIN" \
+    -H "Authorization: Bearer $API_TOKEN" \
+    | jq -r ".result[].id" 2>/dev/null)
+
+  # 2. 彻底清空（不论有多少条）
+  for RID in $ALL_IDS; do
+    if [ -n "$RID" ] && [ "$RID" != "null" ]; then
+      curl -s -X DELETE \
+        "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RID" \
+        -H "Authorization: Bearer $API_TOKEN" > /dev/null
+      echo "$TS [INFO]  已清理旧记录: $RID"
+    fi
+  done
+
+  # 3. 重新建立全新的 3 条 A 记录 (从 ip_roles.txt 获取的 IP)
+  local IPS=("$IP1" "$IP2" "$IP3")
+  for i in {0..2}; do
+    local TARGET_IP="${IPS[$i]}"
+    [ -z "$TARGET_IP" ] && continue
+    
+    local RES
+    RES=$(curl -s -X POST \
+      "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+      -H "Authorization: Bearer $API_TOKEN" \
+      -H "Content-Type: application/json" \
+      --data "{\"type\":\"A\",\"name\":\"$DOMAIN\",\"content\":\"$TARGET_IP\",\"ttl\":60,\"proxied\":false}")
+    
+    local SUCCESS
+    SUCCESS=$(echo "$RES" | jq -r '.success' 2>/dev/null)
+    if [ "$SUCCESS" = "true" ]; then
+      echo "$TS [INFO]  DNS发布成功 #$((i+1)): $TARGET_IP"
+    else
+      echo "$TS [ERROR] DNS发布失败 #$((i+1)): $TARGET_IP"
+    fi
+  done
+}
+
+# ---- 执行同步 -----------------------------------------------
+# 删掉原来的 update_dns_record 调用和“删除多余记录”的 if 块
+# 直接调用这个新函数
+sync_dns_records
+
+# ---- TG通知 -------------------------------------------------
+SP1=$(grep "^${IP1}" "$CHECK_RESULT" | cut -d',' -f6 | tr -d '\r\n')
+SP2=$(grep "^${IP2}" "$CHECK_RESULT" | cut -d',' -f6 | tr -d '\r\n')
+SP3=$(grep "^${IP3}" "$CHECK_RESULT" | cut -d',' -f6 | tr -d '\r\n')
+DC1=$(grep "^${IP1}" "$CHECK_RESULT" | cut -d',' -f7 | tr -d '\r\n[:space:]' | sed 's/[^A-Za-z0-9]//g')
+DC2=$(grep "^${IP2}" "$CHECK_RESULT" | cut -d',' -f7 | tr -d '\r\n[:space:]' | sed 's/[^A-Za-z0-9]//g')
+DC3=$(grep "^${IP3}" "$CHECK_RESULT" | cut -d',' -f7 | tr -d '\r\n[:space:]' | sed 's/[^A-Za-z0-9]//g')
+
+MSG="<b>✅ Cloudflare 优选 IP 更新 (LAX/SEA/SJC)</b>
+
+<b>🕐 时间：</b>$(date '+%Y-%m-%d %H:%M')
+
+<b>📡 ${DOMAIN} DNS角色：</b>
+👑 IP1主用: ${IP1}  ${SP1}MB/s  ${DC1}  [${S1}分]
+⚡ IP2负载: ${IP2}  ${SP2}MB/s  ${DC2}  [${S2}分]
+🔍 IP3探测: ${IP3}  ${SP3}MB/s  ${DC3}  [${S3}分]
+
+<b>📦 KV面板：</b>${KV_PANEL_URL}"
+
+curl -s "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+  -d "chat_id=${TG_CHAT_ID}" \
+  -d "parse_mode=HTML" \
+  --data-urlencode "text=$MSG" > /dev/null
+
+echo "$TS [OK]   TG通知已发送"
+
+# ---- dnspush记录 --------------------------------------------
+curl -s -X POST "${DNSPUSH_URL}?log=1&domain=${DNSPUSH_DOMAIN}" \
+  -H "x-key: ${DNSPUSH_TOKEN}" \
+  --data "${IP1},${IP2},${IP3}" > /dev/null
+
+echo "$TS [OK]   dnspush记录完成"
+
+echo "============================================================"
+echo "$TS 全部完成！"
+echo "$TS IP1(主用)=$IP1[$S1分]  IP2(负载)=$IP2[$S2分]  IP3(探测)=$IP3[$S3分]"
+echo "============================================================"
+EOF
+
+第三：
+
+chmod +x /root/cf_auto_bestip/run_cfst_us.sh
+chmod +x /root/cf_auto_bestip/push_to_kv.sh
+
+第四：
+cd /root/cf_auto_bestip
+./run_cfst_us.sh && ./push_to_kv.sh
+
