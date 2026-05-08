@@ -1,4 +1,4 @@
-第五次改良港区+美区
+第六次改良港区+美区
 第一步：
 cat > /root/cf_auto_bestip/run_cfst_us.sh << 'EOF'
 #!/bin/bash
