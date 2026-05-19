@@ -27,13 +27,13 @@ LATENCY_MAX=400
 LATENCY_MIN=10
 SPEED_MIN=30
 HEALTH_SPEED_MIN=10
-DN=20
+DN=10
 N=20
 DT=10
 PORT=443
-MAX_POOL_SIZE=500
+MAX_POOL_SIZE=200
 SAMPLE_COUNT=1500
-BALANCE_THRESHOLD=200
+BALANCE_THRESHOLD=100
 
 [ -f "$PROJ_DIR/.env" ] && source "$PROJ_DIR/.env"
 mkdir -p "$DATA_DIR" "$LOG_DIR"
@@ -356,13 +356,13 @@ LATENCY_MAX=300
 LATENCY_MIN=5
 SPEED_MIN=30
 HEALTH_SPEED_MIN=10
-DN=20
+DN=10
 N=20
 DT=10
 PORT=443
-MAX_POOL_SIZE=500
+MAX_POOL_SIZE=200
 SAMPLE_COUNT=2000
-BALANCE_THRESHOLD=200
+BALANCE_THRESHOLD=100
 
 [ -f "$PROJ_DIR/.env" ] && source "$PROJ_DIR/.env"
 mkdir -p "$DATA_DIR" "$LOG_DIR"
@@ -717,11 +717,11 @@ LATENCY_MAX=300
 LATENCY_MIN=5
 SPEED_MIN=30
 HEALTH_SPEED_MIN=10
-DN=20
+DN=10
 N=20
 DT=10
 PORT=443
-MAX_POOL_SIZE=300
+MAX_POOL_SIZE=200
 SAMPLE_COUNT=1500
 BALANCE_THRESHOLD=100
 
@@ -1048,10 +1048,10 @@ cat > /root/cf_auto_bestip/push_to_kv.sh << 'EOF'
 #  push_to_kv.sh — 读加权榜→KV推送→DNS同步→TG通知
 #
 #  依赖文件（由采集脚本生成）：
-#    /tmp/weighted_us.txt    US加权榜
-#    /tmp/weighted_hk.txt    HK主池加权榜
-#    /tmp/weighted_hk18.txt  HK-18专池加权榜
-#    /tmp/all_scored_hk.txt  HK今日评分（供IP3选拔）
+#    /tmp/weighted_us.txt     US加权榜
+#    /tmp/weighted_hk.txt     HK主池加权榜
+#    /tmp/weighted_hk18.txt   HK-18专池加权榜
+#    /tmp/all_scored_hk.txt   HK今日评分（供IP3选拔）
 #    /tmp/all_scored_hk18.txt HK-18今日评分（供IP4选拔）
 #
 #  DNS四角色（全HK）：
@@ -1059,6 +1059,8 @@ cat > /root/cf_auto_bestip/push_to_kv.sh << 'EOF'
 #    IP2 = HK-18池 加权第1（104.18段，高峰抗压）
 #    IP3 = HK主池 今日第1（排除IP1，探测）
 #    IP4 = HK-18池 今日第1（排除IP2，探测）
+#    注：HK18今日无达速IP时，IP2/IP4 保持昨日记录不变，
+#        不兜底使用主池IP（保持雨露均沾的设计意义）
 #
 #  KV三份共20条：
 #    US优选前7条 + HK主池优选前7条 + HK-18优选前6条
@@ -1087,7 +1089,6 @@ echo "           IP3=HK主池今日第1  IP4=HK18今日第1"
 echo "  KV配额:  US×7 + HK×7 + HK18×6 = 20条"
 echo "============================================================"
 
-# ---- 读取今日新增数量（TG通知用）---------------------------
 NEW_US=$(cat /tmp/cfst_new_count_us.txt 2>/dev/null | tr -d '[:space:]')
 NEW_HK=$(cat /tmp/cfst_new_count_hk.txt 2>/dev/null | tr -d '[:space:]')
 NEW_HK18=$(cat /tmp/cfst_new_count_hk18.txt 2>/dev/null | tr -d '[:space:]')
@@ -1096,12 +1097,9 @@ NEW_HK18=$(cat /tmp/cfst_new_count_hk18.txt 2>/dev/null | tr -d '[:space:]')
 [ -z "$NEW_HK18" ] && NEW_HK18=0
 echo "$TS [INFO]  本次新增: US=${NEW_US} / HK=${NEW_HK} / HK18=${NEW_HK18}"
 
-# ============================================================
-# 检查加权榜文件
-# ============================================================
 echo "$TS [INFO]  ── 检查加权榜文件 ────────────────────────────"
 for F in "$WEIGHTED_US" "$WEIGHTED_HK" "$WEIGHTED_HK18"; do
-  LABEL=$(basename "$F" .txt | sed 's/weighted_//' | tr '[:lower:]' '[:upper:]')
+  LABEL=$(basename "$F" .txt | sed 's/weighted_//')
   if [ -s "$F" ]; then
     echo "$TS [INFO]  ${LABEL}加权榜存在（$(wc -l < "$F") 条），前3名:"
     head -3 "$F" | while read -r W I S; do
@@ -1113,13 +1111,8 @@ for F in "$WEIGHTED_US" "$WEIGHTED_HK" "$WEIGHTED_HK18"; do
   fi
 done
 
-# ============================================================
-# DNS四角色选拔
-# ============================================================
 echo "$TS [INFO]  ── DNS角色选拔 ───────────────────────────────"
-echo "$TS [INFO]  IP1=HK主池加权第1  IP2=HK18加权第1  IP3=HK主池今日第1  IP4=HK18今日第1"
 
-# ---- IP1：HK主池 加权第1 ----
 IP1=""; IP1_WSCORE=0; IP1_TODAYSCORE=0
 if [ -s "$WEIGHTED_HK" ]; then
   IP1=$(awk 'NR==1{print $2}' "$WEIGHTED_HK")
@@ -1130,24 +1123,23 @@ else
   echo "$TS [WARN]  HK主池无数据，IP1为空"
 fi
 
-# ---- IP2：HK-18池 加权第1 ----
 IP2=""; IP2_WSCORE=0; IP2_TODAYSCORE=0
 if [ -s "$WEIGHTED_HK18" ]; then
   IP2=$(awk 'NR==1{print $2}' "$WEIGHTED_HK18")
   IP2_WSCORE=$(awk 'NR==1{print $1}' "$WEIGHTED_HK18")
   IP2_TODAYSCORE=$(awk 'NR==1{print $3}' "$WEIGHTED_HK18")
-  echo "$TS [INFO]  IP2(HK18加权第1):  ${IP2}  加权=${IP2_WSCORE}  今日=${IP2_TODAYSCORE}"
+  echo "$TS [INFO]  IP2(HK18加权第1): ${IP2}  加权=${IP2_WSCORE}  今日=${IP2_TODAYSCORE}"
 else
-  echo "$TS [WARN]  HK-18池无数据，IP2为空（兜底：取HK主池加权第2）"
-  if [ -s "$WEIGHTED_HK" ]; then
-    IP2=$(awk 'NR==2{print $2}' "$WEIGHTED_HK")
-    IP2_WSCORE=$(awk 'NR==2{print $1}' "$WEIGHTED_HK")
-    IP2_TODAYSCORE=$(awk 'NR==2{print $3}' "$WEIGHTED_HK")
-    echo "$TS [INFO]  IP2(兜底HK主池加权第2): ${IP2}  加权=${IP2_WSCORE}"
+  IP2=$(grep "^IP2=" "$ROLES_FILE" 2>/dev/null | cut -d'=' -f2)
+  IP2_WSCORE="昨日"
+  IP2_TODAYSCORE="N/A"
+  if [ -n "$IP2" ]; then
+    echo "$TS [WARN]  HK18今日加权榜为空（全段限速），IP2保持昨日: ${IP2}"
+  else
+    echo "$TS [WARN]  HK18无数据且无昨日记录，IP2为空"
   fi
 fi
 
-# ---- IP3：HK主池 今日第1（排除IP1）----
 IP3=""; IP3_TODAYSCORE=0
 if [ -s "$SCORED_HK" ]; then
   IP3=$(awk -v p1="$IP1" '$2!=""&&$2!=p1{print $2; exit}' "$SCORED_HK")
@@ -1161,7 +1153,6 @@ else
   echo "$TS [WARN]  HK主池无数据，IP3为空"
 fi
 
-# ---- IP4：HK-18池 今日第1（排除IP2）----
 IP4=""; IP4_TODAYSCORE=0
 if [ -s "$SCORED_HK18" ]; then
   IP4=$(awk -v p2="$IP2" '$2!=""&&$2!=p2{print $2; exit}' "$SCORED_HK18")
@@ -1172,34 +1163,36 @@ elif [ -s "$WEIGHTED_HK18" ]; then
   IP4_TODAYSCORE=$(awk -v p2="$IP2" '$2!=p2&&$2!=""{print $3; exit}' "$WEIGHTED_HK18")
   echo "$TS [INFO]  IP4(HK18加权第2降级): ${IP4}  今日=${IP4_TODAYSCORE}"
 else
-  echo "$TS [WARN]  HK-18池无数据，IP4为空"
+  IP4=$(grep "^IP4=" "$ROLES_FILE" 2>/dev/null | cut -d'=' -f2)
+  IP4_TODAYSCORE="N/A"
+  if [ -n "$IP4" ]; then
+    echo "$TS [WARN]  HK18今日无数据，IP4保持昨日: ${IP4}"
+  else
+    echo "$TS [WARN]  HK18无数据且无昨日记录，IP4为空"
+  fi
 fi
 
 printf "IP1=%s\nIP2=%s\nIP3=%s\nIP4=%s\n" "$IP1" "$IP2" "$IP3" "$IP4" > "$ROLES_FILE"
 
 echo "$TS [INFO]  ────────────────────────────────────────────"
-echo "$TS [INFO]  👑 IP1(HK主用)   = ${IP1}  [加权:${IP1_WSCORE}  今日:${IP1_TODAYSCORE}]"
-echo "$TS [INFO]  🛡️  IP2(HK-18)   = ${IP2}  [加权:${IP2_WSCORE}  今日:${IP2_TODAYSCORE}]"
-echo "$TS [INFO]  🔍 IP3(HK探测)  = ${IP3}  [今日:${IP3_TODAYSCORE}]"
-echo "$TS [INFO]  🔎 IP4(HK18探测) = ${IP4}  [今日:${IP4_TODAYSCORE}]"
+echo "$TS [INFO]  👑 IP1(HK主用):   ${IP1}  [加权:${IP1_WSCORE}  今日:${IP1_TODAYSCORE}]"
+echo "$TS [INFO]  🛡 IP2(HK-18):   ${IP2}  [加权:${IP2_WSCORE}  今日:${IP2_TODAYSCORE}]"
+echo "$TS [INFO]  🔍 IP3(HK探测):  ${IP3}  [今日:${IP3_TODAYSCORE}]"
+echo "$TS [INFO]  🔎 IP4(HK18探测): ${IP4}  [今日:${IP4_TODAYSCORE}]"
 echo "$TS [INFO]  ────────────────────────────────────────────"
 
-# ============================================================
-# KV推送：US×7 + HK×7 + HK18×6 = 20条
-# ============================================================
 echo "$TS [INFO]  ── KV推送（US×7 + HK×7 + HK18×6 = 20条）───────"
 DATE=$(date '+%m%d')
 KV_VALUE=""
 KV_TOTAL=0
 
-# US前7条
 if [ -s "$WEIGHTED_US" ]; then
   US_CNT=0
   while IFS= read -r LINE && [ $US_CNT -lt 7 ]; do
     IP=$(echo "$LINE" | awk '{print $2}')
     [ -z "$IP" ] && continue
     NUM=$(printf "%02d" $((US_CNT+1)))
-    ENTRY="${IP}:443#US 美国优选${NUM} ${DATE}"
+    ENTRY="${IP}:443#🇺🇸 US 美国优选${NUM} ${DATE}"
     [ -z "$KV_VALUE" ] && KV_VALUE="$ENTRY" || KV_VALUE="${KV_VALUE}
 ${ENTRY}"
     US_CNT=$((US_CNT+1)); KV_TOTAL=$((KV_TOTAL+1))
@@ -1209,14 +1202,13 @@ else
   echo "$TS [WARN]  US无数据，跳过"
 fi
 
-# HK主池前7条
 if [ -s "$WEIGHTED_HK" ]; then
   HK_CNT=0
   while IFS= read -r LINE && [ $HK_CNT -lt 7 ]; do
     IP=$(echo "$LINE" | awk '{print $2}')
     [ -z "$IP" ] && continue
     NUM=$(printf "%02d" $((HK_CNT+1)))
-    ENTRY="${IP}:443#HK 香港优选${NUM} ${DATE}"
+    ENTRY="${IP}:443##🇭🇰 HK 香港优选${NUM} ${DATE}"
     [ -z "$KV_VALUE" ] && KV_VALUE="$ENTRY" || KV_VALUE="${KV_VALUE}
 ${ENTRY}"
     HK_CNT=$((HK_CNT+1)); KV_TOTAL=$((KV_TOTAL+1))
@@ -1226,21 +1218,20 @@ else
   echo "$TS [WARN]  HK无数据，跳过"
 fi
 
-# HK-18池前6条
 if [ -s "$WEIGHTED_HK18" ]; then
   HK18_CNT=0
   while IFS= read -r LINE && [ $HK18_CNT -lt 6 ]; do
     IP=$(echo "$LINE" | awk '{print $2}')
     [ -z "$IP" ] && continue
     NUM=$(printf "%02d" $((HK18_CNT+1)))
-    ENTRY="${IP}:443#HK18 香港18优选${NUM} ${DATE}"
+    ENTRY="${IP}:443#🇭🇰 HK18 香港18优选${NUM} ${DATE}"
     [ -z "$KV_VALUE" ] && KV_VALUE="$ENTRY" || KV_VALUE="${KV_VALUE}
 ${ENTRY}"
     HK18_CNT=$((HK18_CNT+1)); KV_TOTAL=$((KV_TOTAL+1))
   done < "$WEIGHTED_HK18"
   echo "$TS [INFO]  HK18 KV入选: ${HK18_CNT} 个"
 else
-  echo "$TS [WARN]  HK-18无数据，跳过"
+  echo "$TS [WARN]  HK18今日无达速IP，KV中HK18部分跳过（保持昨日DNS不变）"
 fi
 
 echo "$TS [INFO]  推送 ${KV_TOTAL} 个IP到KV..."
@@ -1255,9 +1246,6 @@ else
   echo "$TS [ERROR]  KV推送失败 (HTTP $HTTP_CODE)"
 fi
 
-# ============================================================
-# DNS全量同步（四条A记录）
-# ============================================================
 echo "$TS [INFO]  ── DNS同步（四条A记录）──────────────────────────"
 ALL_IDS=$(curl -s \
   "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=A&name=$DOMAIN" \
@@ -1286,27 +1274,22 @@ for TARGET_IP in "$IP1" "$IP2" "$IP3" "$IP4"; do
   fi
 done
 
-# ============================================================
-# 速度/机场码读取（TG通知用）
-# head -1 防止同一IP多行导致内容叠加
-# ============================================================
 get_speed() { grep "^${1}" "$2" 2>/dev/null | head -1 | cut -d',' -f6 | tr -d '\r\n'; }
 get_dc()    { grep "^${1}" "$2" 2>/dev/null | head -1 | cut -d',' -f7 | tr -d '\r\n[:space:]' | sed 's/[^A-Za-z0-9]//g'; }
 
 SP1=$(get_speed "$IP1" "$RESULT_HK");   [ -z "$SP1" ] && SP1="N/A"
-SP2=$(get_speed "$IP2" "$RESULT_HK18"); [ -z "$SP2" ] && SP2="N/A"
+SP2=$(get_speed "$IP2" "$RESULT_HK18"); [ -z "$SP2" ] && SP2="昨日保持"
 SP3=$(get_speed "$IP3" "$RESULT_HK");   [ -z "$SP3" ] && SP3="N/A"
-SP4=$(get_speed "$IP4" "$RESULT_HK18"); [ -z "$SP4" ] && SP4="N/A"
+SP4=$(get_speed "$IP4" "$RESULT_HK18"); [ -z "$SP4" ] && SP4="昨日保持"
 DC1=$(get_dc "$IP1" "$RESULT_HK")
-DC2=$(get_dc "$IP2" "$RESULT_HK18")
+DC2=$(get_dc "$IP2" "$RESULT_HK18");    [ -z "$DC2" ] && DC2="HKG"
 DC3=$(get_dc "$IP3" "$RESULT_HK")
-DC4=$(get_dc "$IP4" "$RESULT_HK18")
+DC4=$(get_dc "$IP4" "$RESULT_HK18");    [ -z "$DC4" ] && DC4="HKG"
 
 POOL_US_SIZE=$(wc -l < "$DATA_DIR/cfst_preferred_ips_us.txt" 2>/dev/null || echo 0)
 POOL_HK_SIZE=$(wc -l < "$DATA_DIR/cfst_preferred_ips_hk.txt" 2>/dev/null || echo 0)
 POOL_HK18_SIZE=$(wc -l < "$DATA_DIR/cfst_preferred_ips_hk18.txt" 2>/dev/null || echo 0)
 
-# 动态平衡状态描述
 BALANCE_PARTS=""
 [ "$NEW_US" -gt 0 ]   && BALANCE_PARTS="${BALANCE_PARTS}US淘汰${NEW_US}个 "
 [ "$NEW_HK" -gt 0 ]   && BALANCE_PARTS="${BALANCE_PARTS}HK淘汰${NEW_HK}个 "
@@ -1314,9 +1297,12 @@ BALANCE_PARTS=""
 [ -z "$BALANCE_PARTS" ] && BALANCE_PARTS="今日无新增，跳过平衡"
 BALANCE_PARTS=$(echo "$BALANCE_PARTS" | xargs)
 
-# ============================================================
-# TG通知
-# ============================================================
+if [ -s "$WEIGHTED_HK18" ]; then
+  HK18_STATUS="正常"
+else
+  HK18_STATUS="全段限速，IP2/IP4保持昨日"
+fi
+
 echo "$TS [INFO]  ── TG通知 ────────────────────────────────────"
 MSG="<b>✅ Cloudflare 优选 IP 更新 (HK双池专用解析)</b>
 
@@ -1324,10 +1310,11 @@ MSG="<b>✅ Cloudflare 优选 IP 更新 (HK双池专用解析)</b>
 <b>♻️ 动态平衡：</b>US新增 <code>${NEW_US}</code> / HK新增 <code>${NEW_HK}</code> / HK18新增 <code>${NEW_HK18}</code>
 <b>📊 池子规模：</b>US <code>${POOL_US_SIZE}</code> / HK <code>${POOL_HK_SIZE}</code> / HK18 <code>${POOL_HK18_SIZE}</code>
 <b>⚙️ 平衡状态：</b>${BALANCE_PARTS}
+<b>🌐 HK18状态：</b>${HK18_STATUS}
 
 <b>📡 ${DOMAIN} DNS角色（四条A记录）：</b>
 👑 IP1(HK主用):   ${IP1}  ${SP1}MB/s  ${DC1}  [加权:${IP1_WSCORE}]
-🛡️ IP2(HK18段):  ${IP2}  ${SP2}MB/s  ${DC2}  [加权:${IP2_WSCORE}]
+🛡 IP2(HK18段):  ${IP2}  ${SP2}MB/s  ${DC2}  [加权:${IP2_WSCORE}]
 🔍 IP3(HK探测):  ${IP3}  ${SP3}MB/s  ${DC3}  [今日:${IP3_TODAYSCORE}]
 🔎 IP4(HK18探测): ${IP4}  ${SP4}MB/s  ${DC4}  [今日:${IP4_TODAYSCORE}]
 
@@ -1339,27 +1326,26 @@ curl -s "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
   --data-urlencode "text=$MSG" > /dev/null
 echo "$TS [OK]   TG通知已发送"
 
-# ============================================================
-# dnspush记录（记录四个IP）
-# ============================================================
 curl -s -X POST "${DNSPUSH_URL}?log=1&domain=${DNSPUSH_DOMAIN}" \
   -H "x-key: ${DNSPUSH_TOKEN}" \
   --data "${IP1},${IP2},${IP3},${IP4}" > /dev/null
 echo "$TS [OK]   dnspush记录完成"
 
-# ---- 清理临时文件 -------------------------------------------
 rm -f /tmp/weighted_us.txt /tmp/weighted_hk.txt /tmp/weighted_hk18.txt \
       /tmp/all_scored_us.txt /tmp/all_scored_hk.txt /tmp/all_scored_hk18.txt \
       /tmp/cfst_new_count_us.txt /tmp/cfst_new_count_hk.txt /tmp/cfst_new_count_hk18.txt
 
 echo "============================================================"
 echo "$TS 推送全部完成！KV共 ${KV_TOTAL} 条"
-echo "$TS 👑 IP1(HK主用)   = ${IP1}  [加权:${IP1_WSCORE}]"
-echo "$TS 🛡️  IP2(HK-18)   = ${IP2}  [加权:${IP2_WSCORE}]"
-echo "$TS 🔍 IP3(HK探测)  = ${IP3}  [今日:${IP3_TODAYSCORE}]"
-echo "$TS 🔎 IP4(HK18探测) = ${IP4}  [今日:${IP4_TODAYSCORE}]"
+echo "$TS 👑 IP1(HK主用):   ${IP1}  [加权:${IP1_WSCORE}]"
+echo "$TS 🛡 IP2(HK-18):   ${IP2}  [加权:${IP2_WSCORE}]"
+echo "$TS 🔍 IP3(HK探测):  ${IP3}  [今日:${IP3_TODAYSCORE}]"
+echo "$TS 🔎 IP4(HK18探测): ${IP4}  [今日:${IP4_TODAYSCORE}]"
 echo "============================================================"
 EOF
+
+chmod +x /root/cf_auto_bestip/push_to_kv.sh
+echo "写入完成"
 
 第四步：
 
