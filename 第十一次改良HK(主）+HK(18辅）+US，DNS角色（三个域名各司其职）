@@ -1049,9 +1049,9 @@ cat > /root/cf_auto_bestip/push_to_kv.sh << 'EOF'
 #  push_to_kv.sh — 读加权榜→KV推送→DNS同步（三域名）→TG通知
 #
 #  DNS三域名分工：
-#    testtom.ccwu.cc  → HK主池  IP1(加权第1) + IP3(今日第1)
-#    tom2603.ccwu.cc  → HK18段  IP2(加权第1) + IP4(今日第1)
-#    tomleo.ccwu.cc   → US池    IP_US1(加权第1) + IP_US2(今日第1)
+#    testtom.→ HK主池  IP1(加权第1) + IP3(今日第1)
+#    tom2603.  → HK18段  IP2(加权第1) + IP4(今日第1)
+#    tomleo.   → US池    IP_US1(加权第1) + IP_US2(今日第1)
 #
 #  KV三份共20条：
 #    US优选前7条 + HK主池优选前7条 + HK-18优选前6条
